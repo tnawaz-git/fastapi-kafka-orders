@@ -24,6 +24,9 @@ class Settings(BaseSettings):
 
     database_path: str = "data/orders.db"
 
+    # How long POST /orders waits for Kafka to acknowledge a new order before answering anyway.
+    publish_timeout_seconds: float = 5.0
+
     # Consumer retry policy: a message gets max_attempts tries, then goes to the DLQ.
     max_attempts: int = 3
     retry_backoff_seconds: float = 0.5

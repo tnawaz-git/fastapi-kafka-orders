@@ -29,6 +29,8 @@ def make_handler(settings: Settings, producer: AIOKafkaProducer) -> Handler:
         result = OrderResultEvent.model_validate_json(msg.value)
         if result.status is OrderStatus.CONFIRMED:
             send_email(result.customer_email, f"Your order {result.order_id} is confirmed")
+        elif result.status is OrderStatus.FAILED:
+            send_email(result.customer_email, f"We hit a problem with order {result.order_id} and are looking into it")
         else:
             send_email(result.customer_email, f"Sorry, order {result.order_id} was rejected: {result.reason}")
 

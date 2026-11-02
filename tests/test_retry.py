@@ -36,8 +36,51 @@ def failing_handler(failures: int, error: Exception):
     return handler, calls
 
 
-async def run(handler, producer):
-    await handle_with_retry(FakeMessage(), handler, producer=producer, settings=SETTINGS, group_id="test-group")
+async def run(handler, producer, on_give_up=None):
+    await handle_with_retry(
+        FakeMessage(), handler, producer=producer, settings=SETTINGS, group_id="test-group", on_give_up=on_give_up
+    )
+
+
+def recorder():
+    calls = []
+
+    async def on_give_up(msg, error):
+        calls.append(error)
+
+    return on_give_up, calls
+
+
+async def test_on_give_up_runs_after_dlq():
+    producer = FakeProducer()
+    handler, _ = failing_handler(failures=99, error=RuntimeError("db down"))
+    on_give_up, calls = recorder()
+
+    await run(handler, producer, on_give_up)
+
+    assert len(producer.sent) == 1
+    assert [str(e) for e in calls] == ["db down"]
+
+
+async def test_on_give_up_not_called_on_success():
+    handler, _ = failing_handler(failures=1, error=RuntimeError("blip"))
+    on_give_up, calls = recorder()
+
+    await run(handler, FakeProducer(), on_give_up)
+
+    assert calls == []
+
+
+async def test_failing_on_give_up_does_not_break_the_consumer():
+    producer = FakeProducer()
+    handler, _ = failing_handler(failures=99, error=PermanentError("bad"))
+
+    async def broken(msg, error):
+        raise RuntimeError("boom")
+
+    await run(handler, producer, broken)  # must not raise
+
+    assert len(producer.sent) == 1
 
 
 async def test_transient_failure_is_retried_until_success():

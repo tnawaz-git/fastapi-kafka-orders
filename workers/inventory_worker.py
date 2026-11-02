@@ -10,7 +10,7 @@ import random
 from aiokafka import AIOKafkaProducer
 
 from app.config import Settings, configure_logging, get_settings
-from app.kafka_client import Handler, Message, PermanentError, TransientError, to_bytes
+from app.kafka_client import GiveUpHandler, Handler, Message, PermanentError, TransientError, to_bytes
 from app.schemas import OrderCreatedEvent, OrderResultEvent, OrderStatus
 from workers.runtime import main, run_worker
 
@@ -61,6 +61,26 @@ def make_handler(settings: Settings, producer: AIOKafkaProducer) -> Handler:
     return handle
 
 
+def make_on_give_up(settings: Settings, producer: AIOKafkaProducer) -> GiveUpHandler:
+    """Once an order event is in the DLQ, publish a FAILED result so the order doesn't sit in PENDING forever."""
+
+    async def on_give_up(msg: Message, error: Exception) -> None:
+        try:
+            event = OrderCreatedEvent.model_validate_json(msg.value or b"")
+        except ValueError:
+            return  # unparseable, so there is no order to update
+        result = OrderResultEvent(
+            order_id=event.order_id,
+            customer_email=event.customer_email,
+            status=OrderStatus.FAILED,
+            reason=f"Could not be processed ({type(error).__name__}: {error})",
+        )
+        await producer.send_and_wait(settings.topic_orders_failed, value=to_bytes(result), key=msg.key)
+        logger.error("Order %s FAILED and was parked in %s", event.order_id, settings.topic_orders_dlq)
+
+    return on_give_up
+
+
 async def run(settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     await run_worker(
@@ -69,6 +89,7 @@ async def run(settings: Settings | None = None) -> None:
         group_id=settings.inventory_group_id,
         topics=[settings.topic_orders_created],
         make_handler=lambda producer: make_handler(settings, producer),
+        make_on_give_up=lambda producer: make_on_give_up(settings, producer),
     )
 
 

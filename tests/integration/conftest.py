@@ -5,6 +5,7 @@ import uuid
 
 import httpx
 import pytest
+from aiokafka.admin import AIOKafkaAdminClient
 from asgi_lifespan import LifespanManager
 
 from app.config import Settings
@@ -33,10 +34,11 @@ def kafka_bootstrap():
 
 
 @pytest.fixture
-def settings(kafka_bootstrap, tmp_path) -> Settings:
+async def settings(kafka_bootstrap, tmp_path, request):
+    """Per-test settings. Override fields with @pytest.mark.settings(field=value)."""
     # Unique topic and group names keep tests apart from each other and from any running workers.
     run = f"test-{uuid.uuid4().hex[:8]}"
-    return Settings(
+    values = dict(
         kafka_bootstrap_servers=kafka_bootstrap,
         topic_orders_created=f"{run}.orders.created",
         topic_orders_processed=f"{run}.orders.processed",
@@ -51,6 +53,20 @@ def settings(kafka_bootstrap, tmp_path) -> Settings:
         simulated_failure_rate=0,
         inventory_processing_delay_seconds=0,
     )
+    if marker := request.node.get_closest_marker("settings"):
+        values.update(marker.kwargs)
+    settings = Settings(**values)
+    yield settings
+
+    # Runs after the client and worker fixtures have stopped. Deleting the topics also drops the
+    # test groups' offsets, so the (now empty) groups disappear from the broker as well.
+    admin = AIOKafkaAdminClient(bootstrap_servers=kafka_bootstrap)
+    await admin.start()
+    try:
+        existing = set(await admin.list_topics())
+        await admin.delete_topics([t for t in settings.all_topics if t in existing])
+    finally:
+        await admin.close()
 
 
 @pytest.fixture

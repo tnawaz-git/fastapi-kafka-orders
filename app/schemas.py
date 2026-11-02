@@ -13,6 +13,8 @@ class OrderStatus(str, Enum):
     PENDING = "PENDING"
     CONFIRMED = "CONFIRMED"
     REJECTED = "REJECTED"
+    # Processing kept failing, so the order event was parked in the DLQ for someone to look at.
+    FAILED = "FAILED"
 
 
 # --- API models ---------------------------------------------------------------
@@ -21,7 +23,9 @@ class OrderStatus(str, Enum):
 class OrderCreate(BaseModel):
     customer_email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", examples=["jane@example.com"])
     sku: str = Field(min_length=1, max_length=64, examples=["SKU-KEYBOARD"])
-    quantity: int = Field(gt=0, examples=[2])
+    # The per-order business limit lives in the inventory worker; this cap only keeps the
+    # value storable (SQLite integers are 64-bit, and huge values crashed the insert).
+    quantity: int = Field(gt=0, le=1_000_000, examples=[2])
 
 
 class Order(BaseModel):
@@ -50,7 +54,7 @@ class OrderCreatedEvent(BaseModel):
 
 
 class OrderResultEvent(BaseModel):
-    """Published to orders.processed (CONFIRMED) or orders.failed (REJECTED) by the inventory worker."""
+    """Published to orders.processed (CONFIRMED) or orders.failed (REJECTED, FAILED) by the inventory worker."""
 
     event_id: UUID = Field(default_factory=uuid4)
     order_id: UUID

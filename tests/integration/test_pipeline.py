@@ -41,6 +41,15 @@ async def test_order_flows_through_kafka(client, sku, quantity, expected_status,
         assert reason_part in order["reason"]
 
 
+@pytest.mark.settings(simulated_failure_rate=1.0)
+async def test_order_that_keeps_failing_ends_up_failed(client):
+    response = await client.post("/orders", json={"customer_email": "a@b.co", "sku": "SKU-MOUSE", "quantity": 1})
+
+    order = await wait_for_final_status(client, response.json()["id"])
+    assert order["status"] == "FAILED"
+    assert "Simulated inventory database timeout" in order["reason"]
+
+
 async def test_invalid_request_is_rejected_by_api(client):
     response = await client.post("/orders", json={"customer_email": "not-an-email", "sku": "SKU-MOUSE", "quantity": 0})
 

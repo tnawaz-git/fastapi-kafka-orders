@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from uuid import UUID, uuid4
 
@@ -41,16 +42,39 @@ async def place_order(
     order = await store.create(order_id, body.customer_email, body.sku, body.quantity)
 
     event = OrderCreatedEvent(order_id=order_id, **body.model_dump())
+    # Keying by order_id sends every event for one order to the same partition, in order.
+    delivery = asyncio.ensure_future(
+        producer.send_and_wait(settings.topic_orders_created, value=to_bytes(event), key=str(order_id).encode())
+    )
     try:
-        # Keying by order_id sends every event for one order to the same partition, in order.
-        await producer.send_and_wait(settings.topic_orders_created, value=to_bytes(event), key=str(order_id).encode())
+        await asyncio.wait_for(asyncio.shield(delivery), timeout=settings.publish_timeout_seconds)
     except KafkaError as exc:
         logger.exception("Could not publish order %s", order_id)
         await store.delete(order_id)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Order queue unavailable, try again") from exc
+    except TimeoutError:
+        # The producer keeps the message buffered and delivers it once the broker is reachable,
+        # so don't make the client wait (and retry into a duplicate order): accept it now.
+        logger.warning("Kafka is slow to acknowledge order %s; finishing delivery in the background", order_id)
+        task = asyncio.create_task(_finish_delivery(delivery, order_id, store))
+        _pending_deliveries.add(task)
+        task.add_done_callback(_pending_deliveries.discard)
 
     response.headers["Location"] = f"/orders/{order_id}"
     return order
+
+
+# Deliveries still in flight after their request returned; held here so they aren't garbage-collected.
+_pending_deliveries: set[asyncio.Task] = set()
+
+
+async def _finish_delivery(delivery: asyncio.Future, order_id: UUID, store: OrderStore) -> None:
+    try:
+        await delivery
+        logger.info("Order %s reached Kafka after a delay", order_id)
+    except Exception:
+        logger.exception("Order %s never reached Kafka", order_id)
+        await store.apply_result(order_id, OrderStatus.REJECTED, "Could not be queued for processing, please try again")
 
 
 @router.get("/{order_id}", response_model=Order)

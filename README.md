@@ -38,6 +38,14 @@ curl localhost:8000/orders/<id from the response>
 
 Known SKUs are `SKU-KEYBOARD`, `SKU-MOUSE`, `SKU-MONITOR` and `SKU-HEADSET`. Unknown SKUs and quantities over 10 are rejected.
 
+An order's status is `PENDING` until it's processed, then one of:
+
+| Status | Meaning |
+|---|---|
+| `CONFIRMED` | Stock reserved |
+| `REJECTED` | Business rule failed (`reason` says which) |
+| `FAILED` | Processing kept erroring, so the event was parked in `orders.dlq` for investigation |
+
 Stop it with `docker compose down`. Add `-v` to also delete the SQLite database. Kafka's data isn't kept on a volume, so it starts empty every time.
 
 ## Things to try
@@ -77,7 +85,10 @@ A 4th worker would get no partition and sit idle until another one stops.
 - **Ordering per order.** Messages are keyed by `order_id`, so all events for one order go to the same partition and stay in order.
 - **At-least-once delivery.** Consumers turn auto-commit off and commit an offset only after the message is handled or sent to the DLQ ([app/kafka_client.py](app/kafka_client.py)). A crash means the message is redelivered, never lost. Handlers are idempotent: the API only moves an order out of `PENDING` once ([app/store.py](app/store.py)).
 - **Retries.** Errors are retried with exponential backoff (`MAX_ATTEMPTS`, `RETRY_BACKOFF_SECONDS`). Payloads that can't be parsed skip retries and go straight to the DLQ.
-- **Safe publishing.** The API saves the order *before* publishing, so a result can't arrive for an unknown order. If publishing fails, it removes the row and returns `503`. The producer uses `acks=all` with idempotence on.
+- **No order stuck in PENDING.** When the inventory worker gives up on an order, it parks the event in the DLQ *and* publishes a `FAILED` result, so the customer sees a final status and gets an email.
+- **Safe publishing.** The API saves the order *before* publishing, so a result can't arrive for an unknown order. The producer uses `acks=all` with idempotence on.
+  - If Kafka rejects the message, the API removes the row and returns `503`.
+  - If Kafka doesn't answer within `PUBLISH_TIMEOUT_SECONDS` (5s), for example because the broker is down, the API returns `202 PENDING` anyway. The producer keeps the message buffered and delivers it once Kafka is back. If that delivery finally fails, the order becomes `REJECTED`. This keeps clients from waiting indefinitely and retrying into duplicate orders.
 - **Topics** are created on startup by whichever service starts first ([`ensure_topics`](app/kafka_client.py)). Broker auto-creation is off.
 
 ## Project layout

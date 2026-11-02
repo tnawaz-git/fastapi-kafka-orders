@@ -45,6 +45,8 @@ class Message(Protocol):
 
 
 Handler = Callable[[Message], Awaitable[None]]
+# Called after a message was sent to the DLQ, e.g. to tell others the work won't happen.
+GiveUpHandler = Callable[[Message, Exception], Awaitable[None]]
 
 
 def to_bytes(event: BaseModel) -> bytes:
@@ -155,18 +157,29 @@ async def handle_with_retry(
     producer: AIOKafkaProducer,
     settings: Settings,
     group_id: str,
+    on_give_up: GiveUpHandler | None = None,
 ) -> None:
     """Run handler with exponential backoff. Permanent errors and exhausted retries go to the DLQ."""
+
+    async def give_up(exc: Exception, attempts: int) -> None:
+        await send_to_dlq(producer, settings.topic_orders_dlq, msg, exc, attempts=attempts, group_id=group_id)
+        if on_give_up is not None:
+            try:
+                await on_give_up(msg, exc)
+            except Exception:
+                # The message is already safe in the DLQ; don't let this stop the consumer.
+                logger.exception("on_give_up failed for %s[%d]@%d", msg.topic, msg.partition, msg.offset)
+
     for attempt in range(1, settings.max_attempts + 1):
         try:
             await handler(msg)
             return
         except PERMANENT_ERRORS as exc:
-            await send_to_dlq(producer, settings.topic_orders_dlq, msg, exc, attempts=attempt, group_id=group_id)
+            await give_up(exc, attempt)
             return
         except Exception as exc:
             if attempt == settings.max_attempts:
-                await send_to_dlq(producer, settings.topic_orders_dlq, msg, exc, attempts=attempt, group_id=group_id)
+                await give_up(exc, attempt)
                 return
             delay = settings.retry_backoff_seconds * 2 ** (attempt - 1)
             logger.warning(
@@ -184,6 +197,7 @@ async def run_consumer(
     topics: list[str],
     handler: Handler,
     producer: AIOKafkaProducer,
+    on_give_up: GiveUpHandler | None = None,
 ) -> None:
     """Consume topics until cancelled, committing each offset only after its message is done."""
     consumer = create_consumer(settings, group_id)
@@ -193,7 +207,9 @@ async def run_consumer(
         await retry_async(consumer.start)
         logger.info("[%s] consuming %s as group '%s'", name, ", ".join(topics), group_id)
         async for msg in consumer:
-            await handle_with_retry(msg, handler, producer=producer, settings=settings, group_id=group_id)
+            await handle_with_retry(
+                msg, handler, producer=producer, settings=settings, group_id=group_id, on_give_up=on_give_up
+            )
             await consumer.commit({TopicPartition(msg.topic, msg.partition): msg.offset + 1})
     finally:
         await consumer.stop()
